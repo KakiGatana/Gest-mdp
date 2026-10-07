@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#111827">
+<title>Coffre</title>
+<style>
+:root{--bg:#0f172a;--card:#1e293b;--line:#334155;--txt:#e2e8f0;--mut:#94a3b8;--acc:#6366f1;--bad:#ef4444;--ok:#22c55e}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:16px system-ui,sans-serif}
+.wrap{max-width:560px;margin:0 auto;padding:16px}
+h1{font-size:22px;margin:8px 0 16px}
+input,textarea,button{font:inherit;color:var(--txt)}
+input,textarea{width:100%;padding:12px;background:var(--bg);border:1px solid var(--line);border-radius:10px;margin-bottom:10px}
+button{background:var(--acc);border:0;border-radius:10px;padding:12px 16px;cursor:pointer}
+button.sec{background:var(--card);border:1px solid var(--line)}
+button.bad{background:var(--bad)}
+button:disabled{opacity:.5}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:10px}
+.row{display:flex;gap:8px;align-items:center}
+.row>*{flex:1}
+.row>button.sm{flex:none}
+.mut{color:var(--mut);font-size:14px}
+.err{color:var(--bad);min-height:20px}
+.item{cursor:pointer}
+.item b{display:block}
+.top{display:flex;justify-content:space-between;align-items:center}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ok);color:#000;padding:10px 16px;border-radius:20px;opacity:0;transition:.2s;pointer-events:none}
+.toast.on{opacity:1}
+.hidden{display:none}
+label.f{display:block;font-size:13px;color:var(--mut);margin:4px 0}
+.modal{position:fixed;inset:0;background:#000a;display:flex;align-items:flex-end;justify-content:center;padding:0}
+.modal>div{background:var(--bg);width:100%;max-width:560px;max-height:92vh;overflow:auto;border-radius:16px 16px 0 0;padding:16px}
+</style>
+</head>
+<body>
+<div class="wrap" id="app"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const LS = "coffre.v1";
+const ITER = 600000;
+const LOCK_MS = 2 * 60 * 1000;
+const enc = new TextEncoder(), dec = new TextDecoder();
+const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b)));
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const $ = (h) => { const t = document.createElement("template"); t.innerHTML = h.trim(); return t.content.firstChild; };
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+let key = null, salt = null, entries = [], lockTimer = null, clipTimer = null;
+
+async function derive(pw, s) {
+  const base = await crypto.subtle.importKey("raw", enc.encode(pw), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({name:"PBKDF2", salt:s, iterations:ITER, hash:"SHA-256"}, base,
+    {name:"AES-GCM", length:256}, false, ["encrypt","decrypt"]);
+}
+async function encrypt(k, obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({name:"AES-GCM", iv}, k, enc.encode(JSON.stringify(obj)));
+  return {iv:b64(iv), ct:b64(ct)};
+}
+async function decrypt(k, iv, ct) {
+  const p = await crypto.subtle.decrypt({name:"AES-GCM", iv:unb64(iv)}, k, unb64(ct));
+  return JSON.parse(dec.decode(p));
+}
+async function save() {
+  const {iv, ct} = await encrypt(key, entries);
+  localStorage.setItem(LS, JSON.stringify({v:1, salt:b64(salt), iv, ct}));
+}
+const load = () => { try { return JSON.parse(localStorage.getItem(LS)); } catch { return null; } };
+
+function toast(m) { const t = document.getElementById("toast"); t.textContent = m; t.classList.add("on"); setTimeout(() => t.classList.remove("on"), 1800); }
+function app() { return document.getElementById("app"); }
+function mount(node) { app().replaceChildren(node); }
+
+function resetLock() {
+  clearTimeout(lockTimer);
+  if (key) lockTimer = setTimeout(lock, LOCK_MS);
+}
+["click","keydown","touchstart"].forEach(e => addEventListener(e, resetLock, {passive:true}));
+document.addEventListener("visibilitychange", () => { if (document.hidden && key) lock(); });
+
+function lock() {
+  key = null; entries = []; salt = null;
+  document.querySelectorAll(".modal").forEach(m => m.remove());
+  viewLogin();
+}
+
+/* ---------- Écrans ---------- */
+function viewLogin() {
+  const data = load();
+  const first = !data;
+  const n = $(`<div>
+    <h1>🔐 Coffre</h1>
+    <div class="card">
+      <p class="mut">${first
+        ? "Crée ton mot de passe maître. Il n'est stocké nulle part : <b>si tu l'oublies, tes données sont perdues</b>."
+        : "Entre ton mot de passe maître."}</p>
+      <input id="pw" type="password" placeholder="Mot de passe maître" autocomplete="off">
+      ${first ? '<input id="pw2" type="password" placeholder="Confirme le mot de passe" autocomplete="off">' : ""}
+      <div class="err" id="err"></div>
+      <button id="go" style="width:100%">${first ? "Créer le coffre" : "Déverrouiller"}</button>
+      ${first ? '<p class="mut" style="margin-top:14px">Déjà une sauvegarde ? <a href="#" id="imp" style="color:var(--acc)">Importer</a></p>' : ""}
+    </div></div>`);
+  const err = n.querySelector("#err"), go = n.querySelector("#go"), pw = n.querySelector("#pw");
+  const submit = async () => {
+    err.textContent = "";
+    if (first) {
+      const p2 = n.querySelector("#pw2").value;
+      if (pw.value.length < 10) return err.textContent = "10 caractères minimum.";
+      if (pw.value !== p2) return err.textContent = "Les mots de passe diffèrent.";
+    }
+    go.disabled = true; go.textContent = "…";
+    try {
+      if (first) {
+        salt = crypto.getRandomValues(new Uint8Array(16));
+        key = await derive(pw.value, salt); entries = []; await save();
+      } else {
+        const s = unb64(data.salt), k = await derive(pw.value, s);
+        entries = await decrypt(k, data.iv, data.ct); key = k; salt = s;
+      }
+      resetLock(); viewList();
+    } catch { err.textContent = "Mot de passe incorrect."; go.disabled = false; go.textContent = "Déverrouiller"; }
+  };
+  go.onclick = submit;
+  n.addEventListener("keydown", e => { if (e.key === "Enter") submit(); });
+  const imp = n.querySelector("#imp");
+  if (imp) imp.onclick = e => { e.preventDefault(); pickImport(); };
+  mount(n);
+}
+
+function viewList(q = "") {
+  const n = $(`<div>
+    <div class="top"><h1>🔐 Coffre</h1><div class="row"><button class="sec sm" id="menu">⋯</button><button class="sm" id="add">＋</button></div></div>
+    <input id="q" placeholder="Rechercher…" value="${esc(q)}">
+    <div id="list"></div></div>`);
+  const list = n.querySelector("#list");
+  const f = entries.filter(e => (e.site + e.user).toLowerCase().includes(q.toLowerCase()))
+                   .sort((a, b) => a.site.localeCompare(b.site));
+  if (!f.length) list.innerHTML = `<p class="mut">${entries.length ? "Aucun résultat." : "Aucun mot de passe. Appuie sur ＋ pour en ajouter."}</p>`;
+  f.forEach(e => {
+    const c = $(`<div class="card item"><b>${esc(e.site)}</b><span class="mut">${esc(e.user)}</span></div>`);
+    c.onclick = () => viewEntry(e);
+    list.append(c);
+  });
+  const qi = n.querySelector("#q");
+  qi.oninput = () => { viewList(qi.value); const i = document.getElementById("q"); i.focus(); i.setSelectionRange(i.value.length, i.value.length); };
+  n.querySelector("#add").onclick = () => viewEdit();
+  n.querySelector("#menu").onclick = viewMenu;
+  mount(n);
+}
+
+function modal(inner) {
+  const m = $(`<div class="modal"><div></div></div>`);
+  m.firstChild.append(inner);
+  m.onclick = e => { if (e.target === m) m.remove(); };
+  document.body.append(m);
+  return m;
+}
+
+function copy(text, label) {
+  navigator.clipboard.writeText(text).then(() => {
+    toast(label + " copié (effacé dans 30 s)");
+    clearTimeout(clipTimer);
+    clipTimer = setTimeout(() => navigator.clipboard.writeText("").catch(() => {}), 30000);
+  }).catch(() => toast("Copie impossible"));
+}
+
+function viewEntry(e) {
+  const n = $(`<div>
+    <h1>${esc(e.site)}</h1>
+    <label class="f">Identifiant</label>
+    <div class="row"><input readonly value="${esc(e.user)}"><button class="sec sm" data-c="user">Copier</button></div>
+    <label class="f">Mot de passe</label>
+    <div class="row"><input readonly id="p" type="password" value="${esc(e.pass)}">
+      <button class="sec sm" id="eye">👁</button><button class="sec sm" data-c="pass">Copier</button></div>
+    ${e.notes ? `<label class="f">Notes</label><div class="card mut" style="white-space:pre-wrap">${esc(e.notes)}</div>` : ""}
+    <div class="row" style="margin-top:12px"><button class="sec" id="edit">Modifier</button><button class="bad" id="del">Supprimer</button></div></div>`);
+  const m = modal(n);
+  n.querySelector("#eye").onclick = () => { const p = n.querySelector("#p"); p.type = p.type === "password" ? "text" : "password"; };
+  n.querySelectorAll("[data-c]").forEach(b => b.onclick = () => copy(e[b.dataset.c], b.dataset.c === "pass" ? "Mot de passe" : "Identifiant"));
+  n.querySelector("#edit").onclick = () => { m.remove(); viewEdit(e); };
+  n.querySelector("#del").onclick = async () => {
+    if (!confirm("Supprimer « " + e.site + " » ?")) return;
+    entries = entries.filter(x => x.id !== e.id); await save(); m.remove(); viewList();
+  };
+}
+
+function genPass(len = 20) {
+  const set = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*-_=+";
+  const lim = 256 - (256 % set.length); let out = "";
+  while (out.length < len) for (const b of crypto.getRandomValues(new Uint8Array(len))) if (b < lim && out.length < len) out += set[b % set.length];
+  return out;
+}
+
+function viewEdit(e) {
+  const n = $(`<div>
+    <h1>${e ? "Modifier" : "Nouveau"}</h1>
+    <label class="f">Site / app</label><input id="site" value="${esc(e?.site)}">
+    <label class="f">Identifiant / email</label><input id="user" value="${esc(e?.user)}" autocapitalize="off">
+    <label class="f">Mot de passe</label>
+    <div class="row"><input id="pass" value="${esc(e?.pass)}" autocapitalize="off"><button class="sec sm" id="gen">Générer</button></div>
+    <label class="f">Notes</label><textarea id="notes" rows="3">${esc(e?.notes)}</textarea>
+    <div class="err" id="err"></div>
+    <div class="row"><button class="sec" id="cancel">Annuler</button><button id="ok">Enregistrer</button></div></div>`);
+  const m = modal(n);
+  n.querySelector("#gen").onclick = () => n.querySelector("#pass").value = genPass();
+  n.querySelector("#cancel").onclick = () => m.remove();
+  n.querySelector("#ok").onclick = async () => {
+    const v = id => n.querySelector("#" + id).value;
+    if (!v("site").trim()) return n.querySelector("#err").textContent = "Le nom du site est requis.";
+    const item = {id: e?.id ?? crypto.randomUUID(), site: v("site").trim(), user: v("user").trim(), pass: v("pass"), notes: v("notes")};
+    entries = e ? entries.map(x => x.id === e.id ? item : x) : [...entries, item];
+    await save(); m.remove(); viewList();
+  };
+}
+
+function viewMenu() {
+  const n = $(`<div><h1>Options</h1>
+    <button class="sec" id="exp" style="width:100%;margin-bottom:8px">Exporter une sauvegarde chiffrée</button>
+    <button class="sec" id="imp" style="width:100%;margin-bottom:8px">Importer une sauvegarde</button>
+    <button class="sec" id="chg" style="width:100%;margin-bottom:8px">Changer le mot de passe maître</button>
+    <button class="sec" id="lck" style="width:100%;margin-bottom:8px">Verrouiller</button>
+    <p class="mut">Verrouillage auto après 2 min d'inactivité. ${entries.length} entrée(s).</p></div>`);
+  const m = modal(n);
+  n.querySelector("#lck").onclick = lock;
+  n.querySelector("#exp").onclick = () => {
+    const blob = new Blob([localStorage.getItem(LS)], {type:"application/json"});
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+    a.download = "coffre-" + new Date().toISOString().slice(0, 10) + ".json"; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000); m.remove();
+  };
+  n.querySelector("#imp").onclick = () => { m.remove(); pickImport(); };
+  n.querySelector("#chg").onclick = async () => {
+    const p = prompt("Nouveau mot de passe maître (10 caractères min) :");
+    if (!p) return;
+    if (p.length < 10) return alert("Trop court.");
+    if (prompt("Confirme le nouveau mot de passe :") !== p) return alert("Ils ne correspondent pas.");
+    salt = crypto.getRandomValues(new Uint8Array(16)); key = await derive(p, salt); await save();
+    m.remove(); toast("Mot de passe maître changé");
+  };
+}
+
+function pickImport() {
+  const inp = document.createElement("input"); inp.type = "file"; inp.accept = ".json,application/json";
+  inp.onchange = async () => {
+    try {
+      const d = JSON.parse(await inp.files[0].text());
+      if (!d.salt || !d.iv || !d.ct) throw 0;
+      const p = prompt("Mot de passe maître de cette sauvegarde :"); if (!p) return;
+      const imported = await decrypt(await derive(p, unb64(d.salt)), d.iv, d.ct);
+      if (!key) { // coffre vide : on adopte la sauvegarde telle quelle
+        localStorage.setItem(LS, JSON.stringify(d)); toast("Sauvegarde importée"); viewLogin();
+      } else {
+        const ids = new Set(entries.map(e => e.id));
+        const add = imported.filter(e => !ids.has(e.id));
+        entries = [...entries, ...add]; await save(); toast(add.length + " entrée(s) ajoutée(s)"); viewList();
+      }
+    } catch { alert("Fichier invalide ou mot de passe incorrect."); }
+  };
+  inp.click();
+}
+
+if (!crypto?.subtle) app().textContent = "Ce navigateur ne supporte pas le chiffrement (ouvre la page en HTTPS ou en fichier local).";
+else viewLogin();
+</script>
+</body>
+</html>
